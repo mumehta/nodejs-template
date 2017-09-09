@@ -1,0 +1,44 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: nodejs-template-deployment
+  annotations:
+    iam.amazonaws.com/role: kubernetes-worker-role
+spec:
+  replicas: 3
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: nodejs-template
+        tier: web
+    spec:
+      containers:
+      - name: nodejs-template
+        image: 192.168.99.102:80/nodejs-template
+        ports:
+        - containerPort: 3000
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodejs-template
+  labels:
+    app: nodejs-template
+    tier: web
+spec:
+  type: NodePort
+  selector:
+    app: nodejs-template
+    tier: web
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3000
+    protocol: TCP

@@ -1,0 +1,145 @@
+#!/usr/bin/env groovy
+
+try {
+    node('ubu-slave-1') {
+        stage('Clean workspace') {
+            deleteDir()
+                sh 'ls -lah'
+        }
+
+        stage('Checkout source') {
+            checkout scm
+        }
+
+
+        stage('Run Test Case') {
+          echo 'Running test cases'
+          echo "Passed test cases"
+        }
+
+        stage ('Build docker image') {
+              println "Building and packaging nodejs application"
+              sh 'sleep 5'
+              def img = docker.build('nodejs-template', '.')
+        }
+
+       stage('Publish image') {
+         echo "Publishing docker images"
+         sh "\$(aws ecr get-login --region ap-southeast-2)"
+         // need the following steps below if the token has expired.
+         sh  '''
+               aws_login=$(aws ecr get-login --region ap-southeast-2)
+               if echo "$aws_login" | grep -q -E '^docker login -u AWS -p \\S{1092} -e none https://[0-9]{12}.dkr.ecr.\\S+.amazonaws.com$'; then $aws_login; fi
+              '''
+              docker.withRegistry('https://077077460384.dkr.ecr.ap-southeast-2.amazonaws.com', 'ecr:ap-southeast-2:AWS-SVC-ECS') {
+                  docker.image('nodejs-template').push('latest')
+                  docker.image('nodejs-template').push("build-master-${env.BUILD_NUMBER}")
+             }
+        }
+   }
+}
+  catch (exc) {
+  		echo "Caught: ${err}"
+
+  		String recipient = 'munish.mehta@isentia.com'
+
+  		mail subject: "${env.JOB_NAME} (${env.BUILD_NUMBER}) failed",
+  						body: "It appears that ${env.BUILD_URL} is failing, somebody should do something about that",
+  							to: 'munish.mehta@isentia.com',
+  				 replyTo: 'munish.mehta@isentia.com',
+  						from: 'isentia.jenkins@gmail.com'
+  }
+
+def imageTag = "077077460384.dkr.ecr.ap-southeast-2.amazonaws.com/nodejs-template:build-master-${env.BUILD_NUMBER}"
+def userInput = true
+def didTimeout = false
+long startTime = System.currentTimeMillis()
+
+try {
+  node('ubu-slave-1') {
+    // send to email
+      emailext (
+          subject: "Attention: Deploy to UAT Notification:  ${env.JOB_BASE_NAME} - Build # ${env.BUILD_NUMBER}",
+          body: """
+          Dear User,
+
+          You are receiving this email because you are listed as receipient for ${env.JOB_BASE_NAME} project.
+          The purpose of this notification is to let you know that ${env.JOB_BASE_NAME} has completed building and pushing docker image to ECR repository.
+          It needs approval for proceed to deploy to UAT/Production.
+          Currently, munish.mehta is authorized to deploy to uat and production.
+
+          The approval period is set as 5 minutes currently. If job is not approved within specified time, it will not proceed to deploy.
+          Later if you wish to deploy the image created by this build, you can execute deploy to UAT job.
+
+          Build log can be see at: ${env.BUILD_URL}/console
+
+          Authorized users, for approving build, click here: ${env.BUILD_URL}/input
+
+          Thanks
+          CI/CD team.
+          """,
+          to: 'munish.mehta@isentia.com',
+          recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+        )
+  }
+
+  timeout(time: 360, unit: 'SECONDS') { // wait for 6 minutes
+
+     def approverChoice = input(id: 'approverChoice', message: 'Deploy Now?', ok: 'Deploy', submitter:'munish.mehta', parameters: [
+     [$class: 'ChoiceParameterDefinition', choices: 'uat\nprod', description: 'Select environment to deploy to', name: 'choice']])
+
+     def env = approverChoice
+
+      if(env) {
+
+        stage ('Pull and deploy to cluster') {
+          node ('ubu-slave-1') {
+            echo "Pulling and deploying app from ECR"
+            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'b0097933-cea0-4729-8b7a-1e1f8702299f', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                // copy the kubeconfig file for your cluster to root of application.
+                if(env == "uat") {
+                  echo 'copying kubeconfig for UAT cluster'
+                  sh 'aws s3 cp s3://isentia-kube-config/uat/kubeconfig .'
+                } else {
+                  echo 'copying kubeconfig for production cluster'
+                  sh 'aws s3 cp s3://isentia-kube-config/uat/kubeconfig .'
+                }
+                // create deployment, service and pods
+                sh("sed -i.bak -e 's#077077460384.dkr.ecr.ap-southeast-2.amazonaws.com/nodejs-template:latest#${imageTag}#' -e 's#dev#${env}#' ./deployment.yaml")
+                sh('kubectl apply --namespace=templates --kubeconfig=kubeconfig -f deployment.yaml --record')
+            }
+          }
+        }
+
+      } else {
+        echo "Wrong choice of environment variable. Exiting now."
+      }
+  }
+
+
+
+
+} catch(err) { // timeout reached or input false
+    echo "Caught: ${err}"
+    long timePassed = System.currentTimeMillis() - startTime
+    if (timePassed >= 360 * 1000) {
+        echo 'Timed out'
+        didTimeout = true
+    } else {
+        userInput = false
+        echo "Aborted by: [${user}]"
+    }
+}
+
+node ('ubu-slave-1'){
+    if (didTimeout) {
+        currentBuild.result = 'SUCCESS'
+        echo "no input was received before timeout"
+    } else if (userInput == true) {
+        currentBuild.result = 'SUCCESS'
+        echo "Application getting deployed to UAT Cluster"
+    } else {
+        echo "this was not successful"
+        currentBuild.result = 'FAILURE'
+    }
+}
